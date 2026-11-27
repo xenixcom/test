@@ -1,0 +1,33 @@
+name: macOS audio and Intel probe
+on:
+  push:
+    paths: ['.github/workflows/audio-intel-probe.yml']
+permissions:
+  contents: read
+jobs:
+  audio:
+    runs-on: macos-latest
+    timeout-minutes: 5
+    steps:
+      - name: Generate and play test tone
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import wave, struct, math
+          with wave.open('tone.wav','wb') as w:
+              w.setparams((1,2,48000,48000,'NONE','not compressed'))
+              w.writeframes(b''.join(struct.pack('<h',int(4000*math.sin(2*math.pi*440*i/48000))) for i in range(48000)))
+          PY
+          afplay tone.wav
+          echo AFPLAY_PASS
+          brew list --cask | grep -i blackhole || true
+          brew info --cask blackhole-2ch
+  intel:
+    runs-on: macos-15-intel
+    timeout-minutes: 5
+    steps:
+      - run: |
+          uname -m
+          sw_vers
+          sysctl -n hw.memsize
+          test "$(uname -m)" = x86_64
