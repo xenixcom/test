@@ -1,0 +1,22 @@
+name: Audio loopback capability
+on:
+  push:
+    paths: ['.github/workflows/audio-loopback-probe.yml']
+permissions:
+  contents: read
+jobs:
+  audio:
+    runs-on: macos-latest
+    timeout-minutes: 5
+    steps:
+      - name: Install virtual audio device and inspect
+        run: |
+          set -euo pipefail
+          brew install --cask blackhole-2ch
+          system_profiler SPAudioDataType
+          if system_profiler SPAudioDataType | grep -q 'BlackHole 2ch'; then
+            echo BLACKHOLE_VISIBLE
+          else
+            echo BLACKHOLE_NOT_VISIBLE
+          fi
+          command -v ffmpeg || true
