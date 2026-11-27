@@ -9,14 +9,101 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 5
     steps:
-      - name: Install virtual audio device and inspect
+      - name: Install and check driver visibility
+        shell: bash
         run: |
           set -euo pipefail
           brew install --cask blackhole-2ch
+          if ! system_profiler SPAudioDataType | grep -q 'BlackHole 2ch'; then
+            echo BLACKHOLE_INITIAL_NOT_VISIBLE
+            sudo -n launchctl kickstart -k system/com.apple.audio.coreaudiod || sudo -n killall coreaudiod || true
+            sleep 5
+          fi
           system_profiler SPAudioDataType
           if system_profiler SPAudioDataType | grep -q 'BlackHole 2ch'; then
             echo BLACKHOLE_VISIBLE
           else
             echo BLACKHOLE_NOT_VISIBLE
+            exit 1
           fi
-          command -v ffmpeg || true
+      - name: Compile disposable routing probe
+        run: |
+          cat > /tmp/route.swift <<'SWIFT'
+          import CoreAudio
+          import Foundation
+          func address(_ s: AudioObjectPropertySelector) -> AudioObjectPropertyAddress {
+              AudioObjectPropertyAddress(mSelector:s,mScope:kAudioObjectPropertyScopeGlobal,mElement:kAudioObjectPropertyElementMain)
+          }
+          let system=AudioObjectID(kAudioObjectSystemObject)
+          var a=address(kAudioHardwarePropertyDevices)
+          var size:UInt32=0
+          guard AudioObjectGetPropertyDataSize(system,&a,0,nil,&size)==0 else { exit(1) }
+          var ids=[AudioDeviceID](repeating:0,count:Int(size)/MemoryLayout<AudioDeviceID>.size)
+          guard AudioObjectGetPropertyData(system,&a,0,nil,&size,&ids)==0 else { exit(2) }
+          var match: AudioDeviceID?
+          for id in ids {
+              var n=address(kAudioObjectPropertyName)
+              var name:CFString?=nil
+              var len=UInt32(MemoryLayout<CFString?>.size)
+              if AudioObjectGetPropertyData(id,&n,0,nil,&len,&name)==0, let name=name, (name as String)=="BlackHole 2ch" { match=id }
+          }
+          var output=address(kAudioHardwarePropertyDefaultOutputDevice)
+          var current:AudioDeviceID=0
+          var len=UInt32(MemoryLayout<AudioDeviceID>.size)
+          guard AudioObjectGetPropertyData(system,&output,0,nil,&len,&current)==0 else { exit(3) }
+          if CommandLine.arguments.count==1 { print(current); exit(0) }
+          var target:AudioDeviceID
+          if CommandLine.arguments[1]=="blackhole" { guard let id=match else {exit(4)}; target=id }
+          else { guard let id=UInt32(CommandLine.arguments[1]) else {exit(5)}; target=id }
+          guard AudioObjectSetPropertyData(system,&output,0,nil,len,&target)==0 else {exit(6)}
+          var actual:AudioDeviceID=0
+          guard AudioObjectGetPropertyData(system,&output,0,nil,&len,&actual)==0, actual==target else {exit(7)}
+          print("ROUTE_VERIFIED",actual)
+          SWIFT
+          swiftc /tmp/route.swift -o /tmp/route
+      - name: Measure synthetic tone loopback
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v ffmpeg
+          OLD=$(/tmp/route)
+          trap '/tmp/route "$OLD" || true' EXIT
+          /tmp/route blackhole
+          python3 - <<'PY'
+          import math, wave, struct, subprocess, time
+          with wave.open('tone.wav','wb') as w:
+              w.setparams((1,2,48000,48000*2,'NONE','not compressed'))
+              w.writeframes(b''.join(struct.pack('<h',int(8000*math.sin(2*math.pi*440*i/48000))) for i in range(96000)))
+          with open('capture.log','w') as log:
+              p=subprocess.Popen(['ffmpeg','-nostdin','-y','-f','avfoundation','-i',':BlackHole 2ch','-t','5','-ac','1','-ar','48000','capture.wav'],stdout=log,stderr=log)
+              try:
+                  time.sleep(1.5)
+                  subprocess.run(['afplay','tone.wav'],check=True,timeout=10)
+                  if p.wait(timeout=15): raise RuntimeError('capture failed')
+              finally:
+                  if p.poll() is None: p.kill(); p.wait()
+          with wave.open('capture.wav','rb') as w:
+              rate=w.getframerate()
+              raw=w.readframes(w.getnframes())
+          samples=struct.unpack('<'+'h'*(len(raw)//2),raw)
+          n=rate//5
+          blocks=[samples[i:i+n] for i in range(0,len(samples)-n+1,n)]
+          def power(b,f):
+              return (sum(x*math.cos(2*math.pi*f*i/rate) for i,x in enumerate(b))**2+sum(x*math.sin(2*math.pi*f*i/rate) for i,x in enumerate(b))**2)/len(b)**2
+          best=max(blocks,key=lambda b:power(b,440))
+          rms=(sum(x*x for x in best)/len(best))**.5
+          p440=power(best,440)
+          ratio=p440/max(1,power(best,380),power(best,500))
+          print('LOOPBACK_RMS',rms,'TONE_RATIO',ratio)
+          assert rms>100 and ratio>10
+          print('AUDIO_LOOPBACK_PASS')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: loopback-evidence
+          path: |
+            capture.wav
+            capture.log
+          retention-days: 1
+          if-no-files-found: ignore
