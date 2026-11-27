@@ -1,0 +1,34 @@
+name: Binary integrity and lifecycle
+on:
+  push:
+    paths: ['.github/workflows/binary-integrity.yml']
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: |
+          test ! -e /tmp/sandbox-discovery-marker
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+          s=987654321
+          expected=bytearray()
+          for i in range(1048576):
+              s=(s*1664525+1013904223)&0xffffffff
+              expected.append(s>>24)
+          p=Path("experiments/generated-1m.bin").read_bytes()
+          assert p==expected
+          print("BINARY_MATCH",len(p),hashlib.sha256(p).hexdigest())
+          print("MARKER_ABSENT")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-1m-readback
+          path: experiments/generated-1m.bin
+          retention-days: 1
