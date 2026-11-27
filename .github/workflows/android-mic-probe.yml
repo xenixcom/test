@@ -1,0 +1,164 @@
+name: Android synthetic microphone capture
+on:
+  push:
+    paths: ['.github/workflows/android-mic-probe.yml']
+permissions:
+  contents: read
+jobs:
+  capture:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - name: Set up synthetic audio route
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install --cask blackhole-2ch
+          sudo -n launchctl kickstart -k system/com.apple.audio.coreaudiod || sudo -n killall coreaudiod
+          sleep 5
+          cat > /tmp/route.swift <<'SWIFT'
+          import Foundation
+          import CoreAudio
+          func addr(_ s:AudioObjectPropertySelector)->AudioObjectPropertyAddress {
+              AudioObjectPropertyAddress(mSelector:s,mScope:kAudioObjectPropertyScopeGlobal,mElement:kAudioObjectPropertyElementMain)
+          }
+          let sys=AudioObjectID(kAudioObjectSystemObject)
+          var a=addr(kAudioHardwarePropertyDevices),size:UInt32=0
+          guard AudioObjectGetPropertyDataSize(sys,&a,0,nil,&size)==0 else {exit(1)}
+          var ids=[AudioDeviceID](repeating:0,count:Int(size)/4)
+          guard AudioObjectGetPropertyData(sys,&a,0,nil,&size,&ids)==0 else {exit(2)}
+          var selected:AudioDeviceID=0
+          for id in ids {
+              var n=addr(kAudioObjectPropertyName),name:CFString?=nil
+              var len=UInt32(MemoryLayout<CFString?>.size)
+              if AudioObjectGetPropertyData(id,&n,0,nil,&len,&name)==0,let name=name,(name as String)=="BlackHole 2ch" {selected=id}
+          }
+          guard selected != 0 else {exit(3)}
+          for s in [kAudioHardwarePropertyDefaultInputDevice,kAudioHardwarePropertyDefaultOutputDevice] {
+              var a=addr(s),target=selected,actual:AudioDeviceID=0,len:UInt32=4
+              guard AudioObjectSetPropertyData(sys,&a,0,nil,4,&target)==0,AudioObjectGetPropertyData(sys,&a,0,nil,&len,&actual)==0,actual==target else {exit(4)}
+          }
+          print("SYNTHETIC_ROUTE_READY")
+          SWIFT
+          swiftc /tmp/route.swift -o /tmp/route
+          /tmp/route
+          python3 - <<'PY'
+          import wave,struct,math
+          with wave.open("stimulus.wav","wb") as w:
+              w.setparams((1,2,48000,144000,"NONE","not compressed"))
+              w.writeframes(b"".join(struct.pack("<h",int(7000*math.sin(2*math.pi*523*i/48000))) for i in range(144000)))
+          PY
+      - name: Build disposable Android APK and record
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="$ANDROID_HOME"
+          EMU="$SDK/emulator/emulator"
+          ADB="$SDK/platform-tools/adb"
+          SDKM=$(find "$SDK/cmdline-tools" -name sdkmanager -type f | head -n 1)
+          AVDM="$(dirname "$SDKM")/avdmanager"
+          IMG="system-images;android-33;google_apis;arm64-v8a"
+          "$SDKM" "$IMG" "platforms;android-33" "build-tools;35.0.0"
+          BT="$SDK/build-tools/35.0.0"
+          JAR="$SDK/platforms/android-33/android.jar"
+          mkdir -p src/org/example/micprobe classes dex
+          cat > AndroidManifest.xml <<'XML'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="org.example.micprobe">
+            <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="32"/>
+            <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+            <application android:debuggable="true" android:label="Synthetic microphone probe">
+              <activity android:name=".Probe" android:exported="true"><intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter></activity>
+            </application>
+          </manifest>
+          XML
+          cat > src/org/example/micprobe/Probe.java <<'JAVA'
+          package org.example.micprobe;
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.media.*;
+          import java.io.*;
+          public class Probe extends Activity {
+            @Override public void onCreate(Bundle b) {
+              super.onCreate(b);
+              new Thread(() -> {
+                AudioRecord r=null;
+                try {
+                  int rate=48000;
+                  int min=AudioRecord.getMinBufferSize(rate,AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT);
+                  r=new AudioRecord(MediaRecorder.AudioSource.MIC,rate,AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT,Math.max(min,8192));
+                  if(r.getState()!=AudioRecord.STATE_INITIALIZED) throw new IOException("init");
+                  r.startRecording();
+                  try(FileOutputStream m=openFileOutput("ready",MODE_PRIVATE)){m.write(1);}
+                  byte[] buf=new byte[4096];
+                  long end=android.os.SystemClock.elapsedRealtime()+12000;
+                  try(FileOutputStream out=openFileOutput("sample.pcm",MODE_PRIVATE)){
+                    while(android.os.SystemClock.elapsedRealtime()<end) {
+                      int n=r.read(buf,0,buf.length);
+                      if(n<0)throw new IOException("read "+n);
+                      out.write(buf,0,n);
+                    }
+                  }
+                  try(FileOutputStream m=openFileOutput("done",MODE_PRIVATE)){m.write(1);}
+                }catch(Exception e){android.util.Log.e("MicProbe","record failure",e);}
+                finally{if(r!=null){try{r.stop();}catch(Exception ignored){}r.release();}}
+              }).start();
+            }
+          }
+          JAVA
+          javac -source 8 -target 8 -classpath "$JAR" -d classes src/org/example/micprobe/Probe.java
+          "$BT/d8" --lib "$JAR" --min-api 26 --output dex classes/org/example/micprobe/Probe.class
+          "$BT/aapt2" link -I "$JAR" --manifest AndroidManifest.xml -o unsigned.apk
+          (cd dex; zip -q ../unsigned.apk classes.dex)
+          "$BT/zipalign" -f 4 unsigned.apk aligned.apk
+          keytool -genkeypair -keystore probe.jks -storepass disposable -keypass disposable -alias probe -dname CN=Probe -keyalg RSA -keysize 2048 -validity 1
+          "$BT/apksigner" sign --ks probe.jks --ks-pass pass:disposable --key-pass pass:disposable --out probe.apk aligned.apk
+          export ANDROID_AVD_HOME="$RUNNER_TEMP/probe-avd"
+          mkdir -p "$ANDROID_AVD_HOME"
+          echo no | "$AVDM" create avd --force -n synthetic_audio -k "$IMG" -p "$ANDROID_AVD_HOME/synthetic_audio.avd"
+          "$EMU" -list-avds | grep -Fx synthetic_audio
+          "$EMU" -avd synthetic_audio -no-window -no-snapshot -no-boot-anim -gpu swiftshader_indirect -allow-host-audio > emulator.log 2>&1 &
+          EPID=$!
+          trap '"$ADB" -s emulator-5554 logcat -d -s MicProbe > app.log 2>&1 || true; "$ADB" -s emulator-5554 emu kill || true; kill "$EPID" 2>/dev/null || true' EXIT
+          for i in $(seq 1 100); do
+            if [ "$("$ADB" -s emulator-5554 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)" = 1 ]; then break; fi
+            if ! kill -0 "$EPID" 2>/dev/null; then tail -50 emulator.log; exit 1; fi
+            sleep 3
+          done
+          test "$("$ADB" -s emulator-5554 shell getprop sys.boot_completed | tr -d '\r')" = 1
+          "$ADB" -s emulator-5554 emu avd hostmicon
+          "$ADB" -s emulator-5554 install -g probe.apk
+          "$ADB" -s emulator-5554 shell am start -W -n org.example.micprobe/.Probe
+          for i in $(seq 1 20); do
+            "$ADB" -s emulator-5554 shell run-as org.example.micprobe test -f files/ready && break
+            sleep 1
+          done
+          "$ADB" -s emulator-5554 shell run-as org.example.micprobe test -f files/ready
+          afplay stimulus.wav
+          for i in $(seq 1 20); do
+            "$ADB" -s emulator-5554 shell run-as org.example.micprobe test -f files/done && break
+            sleep 1
+          done
+          "$ADB" -s emulator-5554 shell run-as org.example.micprobe test -f files/done
+          "$ADB" -s emulator-5554 exec-out run-as org.example.micprobe cat files/sample.pcm > sample.pcm
+          python3 - <<'PY'
+          import struct,math
+          from pathlib import Path
+          raw=Path("sample.pcm").read_bytes()
+          s=struct.unpack("<"+"h"*(len(raw)//2),raw)
+          n=9600
+          def power(b,f):
+              return abs(sum(x*complex(math.cos(2*math.pi*f*i/48000),math.sin(2*math.pi*f*i/48000)) for i,x in enumerate(b)))**2/len(b)**2
+          p=max(power(s[i:i+n],523) for i in range(0,len(s)-n+1,n))
+          print("ANDROID_TONE_POWER",p,"SAMPLES",len(s))
+          assert p>100
+          print("ANDROID_SYNTHETIC_MIC_PASS")
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: android-mic-diagnostics
+          path: |
+            emulator.log
+            app.log
+          retention-days: 1
+          if-no-files-found: ignore
