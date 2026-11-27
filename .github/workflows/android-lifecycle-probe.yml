@@ -1,0 +1,63 @@
+name: Android and runner lifecycle probe
+on:
+  push:
+    paths: ['.github/workflows/android-lifecycle-probe.yml']
+permissions:
+  contents: read
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Inspect and boot disposable emulator
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "SDK_ROOT_PRESENT=$([ -n "${ANDROID_HOME:-}" ] && echo yes || echo no)"
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          ls "$SDK" || true
+          find "$SDK" -maxdepth 4 -name system.img -print 2>/dev/null || true
+          sudo -n test -c /dev/kvm
+          sudo -n chmod g+rw /dev/kvm
+          sudo -n setfacl -m "u:$(id -un):rw" /dev/kvm
+          python3 -c 'import os,fcntl; f=os.open("/dev/kvm",os.O_RDWR); print("KVM_API_VERSION",fcntl.ioctl(f,0xAE00,0)); os.close(f)'
+          EMU="$SDK/emulator/emulator"
+          ADB="$SDK/platform-tools/adb"
+          SDKM=$(find "$SDK/cmdline-tools" -name sdkmanager -type f | head -n 1)
+          AVDM="$(dirname "$SDKM")/avdmanager"
+          if [ ! -x "$EMU" ]; then "$SDKM" "emulator"; fi
+          IMG="system-images;android-33;google_apis;x86_64"
+          if [ ! -f "$SDK/system-images/android-33/google_apis/x86_64/system.img" ]; then
+            "$SDKM" "$IMG"
+          fi
+          echo no | "$AVDM" create avd --force -n sandbox_probe -k "$IMG"
+          "$EMU" -avd sandbox_probe -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect > emulator.log 2>&1 &
+          EPID=$!
+          trap '"$ADB" -s emulator-5554 emu kill || true; kill "$EPID" 2>/dev/null || true' EXIT
+          for i in $(seq 1 90); do
+            if [ "$("$ADB" -s emulator-5554 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)" = 1 ]; then
+              "$ADB" -s emulator-5554 shell getprop ro.build.version.sdk
+              echo ANDROID_BOOT_PASS
+              exit 0
+            fi
+            if ! kill -0 "$EPID" 2>/dev/null; then tail -50 emulator.log; exit 1; fi
+            sleep 3
+          done
+          tail -50 emulator.log
+          exit 1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: android-probe-log
+          path: emulator.log
+          retention-days: 1
+          if-no-files-found: ignore
+  lifecycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Check job isolation
+        run: |
+          test ! -e /tmp/sandbox-discovery-marker
+          touch /tmp/sandbox-discovery-marker
+          echo MARKER_CREATED
