@@ -1,0 +1,29 @@
+name: Sandbox smoke test
+on:
+  push:
+    paths:
+      - '.github/workflows/sandbox-smoke.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check runner and generate synthetic report
+        shell: bash
+        run: |
+          set -euo pipefail
+          uname -sm
+          python3 --version
+          node --version
+          python3 -c 'import json; from pathlib import Path; assert 2+2==4; Path("result.json").write_text(json.dumps({"test":"sandbox-smoke","result":"PASS","value":4})+"\n")'
+          cat result.json
+      - name: Upload synthetic report
+        uses: actions/upload-artifact@v4
+        with:
+          name: sandbox-smoke-result
+          path: result.json
+          retention-days: 1
+          if-no-files-found: error
