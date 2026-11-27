@@ -26,84 +26,99 @@ jobs:
             echo BLACKHOLE_NOT_VISIBLE
             exit 1
           fi
-      - name: Compile disposable routing probe
-        run: |
-          cat > /tmp/route.swift <<'SWIFT'
-          import CoreAudio
-          import Foundation
-          func address(_ s: AudioObjectPropertySelector) -> AudioObjectPropertyAddress {
-              AudioObjectPropertyAddress(mSelector:s,mScope:kAudioObjectPropertyScopeGlobal,mElement:kAudioObjectPropertyElementMain)
-          }
-          let system=AudioObjectID(kAudioObjectSystemObject)
-          var a=address(kAudioHardwarePropertyDevices)
-          var size:UInt32=0
-          guard AudioObjectGetPropertyDataSize(system,&a,0,nil,&size)==0 else { exit(1) }
-          var ids=[AudioDeviceID](repeating:0,count:Int(size)/MemoryLayout<AudioDeviceID>.size)
-          guard AudioObjectGetPropertyData(system,&a,0,nil,&size,&ids)==0 else { exit(2) }
-          var match: AudioDeviceID?
-          for id in ids {
-              var n=address(kAudioObjectPropertyName)
-              var name:CFString?=nil
-              var len=UInt32(MemoryLayout<CFString?>.size)
-              if AudioObjectGetPropertyData(id,&n,0,nil,&len,&name)==0, let name=name, (name as String)=="BlackHole 2ch" { match=id }
-          }
-          var output=address(kAudioHardwarePropertyDefaultOutputDevice)
-          var current:AudioDeviceID=0
-          var len=UInt32(MemoryLayout<AudioDeviceID>.size)
-          guard AudioObjectGetPropertyData(system,&output,0,nil,&len,&current)==0 else { exit(3) }
-          if CommandLine.arguments.count==1 { print(current); exit(0) }
-          var target:AudioDeviceID
-          if CommandLine.arguments[1]=="blackhole" { guard let id=match else {exit(4)}; target=id }
-          else { guard let id=UInt32(CommandLine.arguments[1]) else {exit(5)}; target=id }
-          guard AudioObjectSetPropertyData(system,&output,0,nil,len,&target)==0 else {exit(6)}
-          var actual:AudioDeviceID=0
-          guard AudioObjectGetPropertyData(system,&output,0,nil,&len,&actual)==0, actual==target else {exit(7)}
-          print("ROUTE_VERIFIED",actual)
-          SWIFT
-          swiftc /tmp/route.swift -o /tmp/route
-      - name: Measure synthetic tone loopback
+      - name: Native capture and playback
         shell: bash
         run: |
           set -euo pipefail
-          command -v ffmpeg
-          OLD=$(/tmp/route)
-          trap '/tmp/route "$OLD" || true' EXIT
-          /tmp/route blackhole
           python3 - <<'PY'
-          import math, wave, struct, subprocess, time
-          with wave.open('tone.wav','wb') as w:
-              w.setparams((1,2,48000,48000*2,'NONE','not compressed'))
-              w.writeframes(b''.join(struct.pack('<h',int(8000*math.sin(2*math.pi*440*i/48000))) for i in range(96000)))
-          with open('capture.log','w') as log:
-              p=subprocess.Popen(['ffmpeg','-nostdin','-y','-f','avfoundation','-i',':BlackHole 2ch','-t','5','-ac','1','-ar','48000','capture.wav'],stdout=log,stderr=log)
-              try:
-                  time.sleep(1.5)
-                  subprocess.run(['afplay','tone.wav'],check=True,timeout=10)
-                  if p.wait(timeout=15): raise RuntimeError('capture failed')
-              finally:
-                  if p.poll() is None: p.kill(); p.wait()
-          with wave.open('capture.wav','rb') as w:
-              rate=w.getframerate()
-              raw=w.readframes(w.getnframes())
-          samples=struct.unpack('<'+'h'*(len(raw)//2),raw)
-          n=rate//5
-          blocks=[samples[i:i+n] for i in range(0,len(samples)-n+1,n)]
-          def power(b,f):
-              return (sum(x*math.cos(2*math.pi*f*i/rate) for i,x in enumerate(b))**2+sum(x*math.sin(2*math.pi*f*i/rate) for i,x in enumerate(b))**2)/len(b)**2
-          best=max(blocks,key=lambda b:power(b,440))
-          rms=(sum(x*x for x in best)/len(best))**.5
-          p440=power(best,440)
-          ratio=p440/max(1,power(best,380),power(best,500))
-          print('LOOPBACK_RMS',rms,'TONE_RATIO',ratio)
-          assert rms>100 and ratio>10
-          print('AUDIO_LOOPBACK_PASS')
+          import wave, math, struct
+          with wave.open("tone.wav","wb") as w:
+              w.setparams((1,2,48000,96000,"NONE","not compressed"))
+              w.writeframes(b"".join(struct.pack("<h",int(8000*math.sin(2*math.pi*440*i/48000))) for i in range(96000)))
           PY
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: loopback-evidence
-          path: |
-            capture.wav
-            capture.log
-          retention-days: 1
-          if-no-files-found: ignore
+          cat > /tmp/native-loop.swift <<'SWIFT'
+          import Foundation
+          import CoreAudio
+          import AVFoundation
+          func addr(_ selector: AudioObjectPropertySelector) -> AudioObjectPropertyAddress {
+              AudioObjectPropertyAddress(mSelector: selector,mScope: kAudioObjectPropertyScopeGlobal,mElement: kAudioObjectPropertyElementMain)
+          }
+          let system=AudioObjectID(kAudioObjectSystemObject)
+          func get(_ selector: AudioObjectPropertySelector) throws -> AudioDeviceID {
+              var a=addr(selector), id:AudioDeviceID=0
+              var size=UInt32(MemoryLayout<AudioDeviceID>.size)
+              let status=AudioObjectGetPropertyData(system,&a,0,nil,&size,&id)
+              guard status==0 else { throw NSError(domain:"getDevice",code:Int(status)) }
+              return id
+          }
+          func set(_ selector: AudioObjectPropertySelector,_ id: AudioDeviceID) throws {
+              var a=addr(selector), target=id
+              let status=AudioObjectSetPropertyData(system,&a,0,nil,UInt32(MemoryLayout<AudioDeviceID>.size),&target)
+              guard status==0, try get(selector)==id else { throw NSError(domain:"setDevice",code:Int(status)) }
+          }
+          func run() throws {
+              var a=addr(kAudioHardwarePropertyDevices), size:UInt32=0
+              guard AudioObjectGetPropertyDataSize(system,&a,0,nil,&size)==0 else { throw NSError(domain:"devices",code:1) }
+              var ids=[AudioDeviceID](repeating:0,count:Int(size)/MemoryLayout<AudioDeviceID>.size)
+              guard AudioObjectGetPropertyData(system,&a,0,nil,&size,&ids)==0 else { throw NSError(domain:"devices",code:2) }
+              var target:AudioDeviceID?
+              for id in ids {
+                  var n=addr(kAudioObjectPropertyName)
+                  var name:CFString?=nil
+                  var len=UInt32(MemoryLayout<CFString?>.size)
+                  if AudioObjectGetPropertyData(id,&n,0,nil,&len,&name)==0, let name=name, (name as String)=="BlackHole 2ch" { target=id }
+              }
+              guard let target=target else { throw NSError(domain:"blackhole",code:3) }
+              let input=kAudioHardwarePropertyDefaultInputDevice, output=kAudioHardwarePropertyDefaultOutputDevice
+              let oldIn=try get(input),oldOut=try get(output)
+              defer {
+                  do { try set(output,oldOut); try set(input,oldIn); print("ROUTE_RESTORED") }
+                  catch { print("ROUTE_RESTORE_FAILED",error) }
+              }
+              try set(input,target); try set(output,target)
+              print("ROUTES_VERIFIED")
+              Thread.sleep(forTimeInterval:1)
+              let engine=AVAudioEngine(), node=engine.inputNode
+              let fmt=node.outputFormat(forBus:0)
+              print("FORMAT",fmt.sampleRate,fmt.channelCount)
+              guard fmt.sampleRate>0,fmt.channelCount>0 else { throw NSError(domain:"format",code:4) }
+              let lock=NSLock()
+              var samples=[Float]()
+              node.installTap(onBus:0,bufferSize:2048,format:fmt) { b,_ in
+                  guard let data=b.floatChannelData?[0] else {return}
+                  lock.lock()
+                  samples.append(contentsOf:UnsafeBufferPointer(start:data,count:Int(b.frameLength)))
+                  lock.unlock()
+              }
+              defer {node.removeTap(onBus:0); engine.stop()}
+              try engine.start()
+              Thread.sleep(forTimeInterval:1)
+              let p=Process()
+              p.executableURL=URL(fileURLWithPath:"/usr/bin/afplay")
+              p.arguments=["tone.wav"]
+              try p.run()
+              p.waitUntilExit()
+              Thread.sleep(forTimeInterval:1)
+              engine.stop()
+              lock.lock(); let result=samples; lock.unlock()
+              let rate=fmt.sampleRate, n=Int(rate/5)
+              print("CAPTURE_SAMPLES",result.count)
+              guard result.count>=n,n>0 else {throw NSError(domain:"capture",code:5)}
+              func power(_ b:ArraySlice<Float>,_ f:Double)->Double {
+                  var re=0.0,im=0.0
+                  for (i,x) in b.enumerated() {let t=2*Double.pi*f*Double(i)/rate;re+=Double(x)*cos(t);im+=Double(x)*sin(t)}
+                  return (re*re+im*im)/Double(b.count*b.count)
+              }
+              var best=0.0, ratio=0.0
+              for i in stride(from:0,through:result.count-n,by:n) {
+                  let b=result[i..<i+n], v=power(b,440)
+                  if v>best {best=v;ratio=v/max(1e-12,max(power(b,380),power(b,500)))}
+              }
+              print("LOOPBACK_POWER",best,"TONE_RATIO",ratio)
+              guard p.terminationStatus==0,best>1e-6,ratio>10 else {throw NSError(domain:"measurement",code:6)}
+              print("AUDIO_LOOPBACK_PASS")
+          }
+          do { try run() } catch { print("NATIVE_PROBE_ERROR",error); exit(1) }
+          SWIFT
+          swiftc /tmp/native-loop.swift -o /tmp/native-loop
+          python3 -c 'import subprocess; subprocess.run(["/tmp/native-loop"],check=True,timeout=35)'
