@@ -1,0 +1,39 @@
+name: Runner capability probe
+on:
+  push:
+    paths: ['.github/workflows/runner-capabilities.yml']
+permissions:
+  contents: read
+jobs:
+  mac:
+    runs-on: macos-latest
+    timeout-minutes: 5
+    steps:
+      - name: Inventory only
+        run: |
+          sw_vers
+          sysctl -n hw.memsize
+          xcrun simctl list runtimes
+          xcrun simctl list devices available
+          system_profiler SPAudioDataType
+          command -v brew || true
+          if [ -n "${ANDROID_HOME:-}" ]; then
+            "$ANDROID_HOME/emulator/emulator" -version || true
+            "$ANDROID_HOME/emulator/emulator" -list-avds || true
+            "$ANDROID_HOME/emulator/emulator" -accel-check || true
+          fi
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Inventory only
+        run: |
+          free -m
+          df -h .
+          ls -l /dev/kvm || true
+          command -v docker || true
+          command -v adb || true
+          if [ -n "${ANDROID_HOME:-}" ]; then
+            "$ANDROID_HOME/emulator/emulator" -list-avds || true
+            "$ANDROID_HOME/emulator/emulator" -accel-check || true
+          fi
