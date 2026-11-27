@@ -1,0 +1,56 @@
+name: Native runtime boundaries
+on:
+  push:
+    paths: ['.github/workflows/native-boundaries.yml']
+permissions:
+  contents: read
+jobs:
+  mac:
+    runs-on: macos-latest
+    timeout-minutes: 5
+    steps:
+      - name: Native runtime and Android inventory
+        run: |
+          set -euo pipefail
+          cat > /tmp/audio-probe.swift <<'SWIFT'
+          import CoreAudio
+          import Foundation
+          var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+          var device: AudioDeviceID = 0
+          var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+          let status = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &device)
+          print("COREAUDIO_STATUS=\(status) DEVICE_PRESENT=\(device != 0)")
+          exit(status == 0 && device != 0 ? 0 : 1)
+          SWIFT
+          swiftc /tmp/audio-probe.swift -o /tmp/audio-probe
+          /tmp/audio-probe
+          if [ -n "${ANDROID_HOME:-}" ]; then
+            echo ANDROID_HOME_PRESENT
+            ls "$ANDROID_HOME/system-images" 2>/dev/null || true
+            find "$ANDROID_HOME/system-images" -name system.img -print 2>/dev/null || true
+            "$ANDROID_HOME/emulator/emulator" -list-avds
+          fi
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Runtime and network checks
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, fcntl, urllib.request
+          try:
+              fd=os.open('/dev/kvm',os.O_RDWR)
+              print("KVM_API_VERSION",fcntl.ioctl(fd,0xAE00,0))
+              os.close(fd)
+          except OSError as e:
+              print("KVM_OPEN_FAILED",e.errno)
+          try:
+              with urllib.request.urlopen('https://github.com',timeout=10) as r:
+                  print("HTTPS_STATUS",r.status)
+          except Exception as e:
+              print("HTTPS_FAILED",type(e).__name__)
+          PY
+          echo "ANDROID_HOME_PRESENT=$([ -n "${ANDROID_HOME:-}" ] && echo yes || echo no)"
+          docker info --format '{{.ServerVersion}}' || true
+          command -v sudo
