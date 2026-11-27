@@ -30,7 +30,11 @@ jobs:
           if [ ! -f "$SDK/system-images/android-33/google_apis/x86_64/system.img" ]; then
             "$SDKM" "$IMG"
           fi
-          echo no | "$AVDM" create avd --force -n sandbox_probe -k "$IMG"
+          export ANDROID_AVD_HOME="$RUNNER_TEMP/probe-avd"
+          mkdir -p "$ANDROID_AVD_HOME"
+          echo no | "$AVDM" create avd --force -n sandbox_probe -k "$IMG" -p "$ANDROID_AVD_HOME/sandbox_probe.avd"
+          ls -la "$ANDROID_AVD_HOME"
+          "$EMU" -list-avds | grep -Fx sandbox_probe
           "$EMU" -avd sandbox_probe -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect > emulator.log 2>&1 &
           EPID=$!
           trap '"$ADB" -s emulator-5554 emu kill || true; kill "$EPID" 2>/dev/null || true' EXIT
