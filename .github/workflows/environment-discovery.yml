@@ -1,0 +1,40 @@
+name: Environment discovery matrix
+on:
+  push:
+    paths:
+      - '.github/workflows/environment-discovery.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    steps:
+      - name: Probe runner
+        shell: python
+        run: |
+          import platform, os, shutil, subprocess, json
+          tools = {}
+          for name, args in {"python":["--version"],"node":["--version"],"git":["--version"],"rustc":["--version"],"swift":["--version"],"xcodebuild":["-version"],"adb":["version"]}.items():
+              if shutil.which(name):
+                  try:
+                      p = subprocess.run([name,*args],capture_output=True,text=True,timeout=20)
+                      tools[name] = {"exit":p.returncode,"version":(p.stdout+p.stderr).strip()[:500]}
+                  except Exception as e:
+                      tools[name] = {"error":type(e).__name__}
+              else:
+                  tools[name] = None
+          report = {"os":platform.system(),"release":platform.release(),"arch":platform.machine(),"cpu_count":os.cpu_count(),"free_disk_bytes":shutil.disk_usage(".").free,"tools":tools}
+          print(json.dumps(report,indent=2))
+          with open("environment.json","w") as f:
+              json.dump(report,f,indent=2)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: environment-${{ matrix.os }}
+          path: environment.json
+          retention-days: 1
